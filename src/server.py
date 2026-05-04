@@ -13,12 +13,13 @@ Usage:
 VERSION = "2.3.0"
 
 import base64
-import os
-import sys
 import json
 import logging
+import os
 import platform
+import re
 import subprocess
+import sys
 import tempfile
 import time
 from typing import Dict, Any, Optional, List
@@ -411,6 +412,20 @@ def _unknown(action, valid):
 def _normalize_cdl(cdl):
     """Normalize CDL payloads to the string format Resolve's SetCDL expects."""
     return normalize_cdl_payload(cdl)
+
+
+def _tc_from_frame(tl, frame_number: int, fps: float) -> str:
+    """Convert an absolute timeline frame number to a timecode string (HH:MM:SS:FF)."""
+    start_frame = tl.GetStartFrame()
+    start_tc = (tl.GetStartTimecode() or "00:00:00:00").replace(";", ":")
+    parts = start_tc.split(":")
+    h, m, s, f = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+    fps_int = max(1, round(fps))
+    start_total = (h * 3600 + m * 60 + s) * fps_int + f
+    total = start_total + (frame_number - start_frame)
+    ff = total % fps_int
+    secs = total // fps_int
+    return f"{secs // 3600:02d}:{(secs % 3600) // 60:02d}:{secs % 60:02d}:{ff:02d}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2883,6 +2898,850 @@ def fusion_comp(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[st
     ])
 
 
+FUSCRIPT_PATH = (
+    "/Applications/DaVinci Resolve/DaVinci Resolve.app"
+    "/Contents/Libraries/Fusion/fuscript"
+)
+
+
+def _run_lua(script: str, timeout: int = 30) -> dict:
+    """Write `script` to a temp file and execute it via fuscript. Returns {stdout, stderr, returncode}."""
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".lua", mode="w", delete=False) as f:
+        f.write(script)
+        lua_path = f.name
+    try:
+        result = subprocess.run(
+            [FUSCRIPT_PATH, lua_path],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        return {"stdout": result.stdout, "stderr": result.stderr, "returncode": result.returncode}
+    except FileNotFoundError:
+        return {"stdout": "", "stderr": f"fuscript not found at {FUSCRIPT_PATH}", "returncode": -1}
+    except subprocess.TimeoutExpired:
+        return {"stdout": "", "stderr": "fuscript timed out", "returncode": -2}
+    finally:
+        try:
+            os.unlink(lua_path)
+        except OSError:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TOOL 28: video_ai
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SHOT_TYPE_COLORS = {
+    "Wide": "Blue",
+    "Medium": "Cyan",
+    "Close-Up": "Green",
+    "Extreme Close-Up": "Yellow",
+    "OTS": "Purple",
+    "POV": "Pink",
+    "Aerial": "Teal",
+    "Insert": "Orange",
+}
+
+_ANALYSIS_PROMPT = """Analyze this video frame and return ONLY valid JSON with no other text.
+
+{
+  "shot_type": "one of: Wide, Medium, Close-Up, Extreme Close-Up, OTS, POV, Aerial, Insert",
+  "qc": {
+    "overexposed": false,
+    "underexposed": false,
+    "out_of_focus": false,
+    "noisy": false,
+    "shaky": false,
+    "issues": []
+  },
+  "description": "One sentence describing what is happening in this shot."
+}
+
+Definitions:
+- Wide: full environment visible, subject small
+- Medium: subject from waist up
+- Close-Up: face or object fills frame
+- Extreme Close-Up: eyes, hands, or single detail
+- OTS: camera behind shoulder looking at subject
+- POV: camera from subject's perspective
+- Aerial: overhead/drone shot
+- Insert: extreme close-up of object/detail (not a person)
+
+Only return the JSON object, no explanation."""
+
+_MOOD_PROMPT = """Analyze the lighting and mood of this video frame. Return ONLY valid JSON:
+
+{
+  "time_of_day": "one of: Golden Hour, Day, Dusk, Dawn, Night, Indoor, Unknown",
+  "location": "one of: Indoor, Outdoor, Mixed",
+  "lighting_quality": "one of: Natural, Artificial, Mixed, Low-Key, High-Key",
+  "mood": "one of: Dramatic, Intimate, Epic, Neutral, Upbeat, Melancholic"
+}
+
+Only return the JSON object, no explanation."""
+
+_SYNC_BROLL_PROMPT = """Look at this video frame. Return ONLY valid JSON:
+
+{
+  "type": "Dialogue or B-Roll or Mixed",
+  "confidence": 0.9,
+  "description": "One sentence explaining the classification."
+}
+
+Dialogue = person speaking directly to camera or in an interview setup.
+B-Roll = no direct address, establishing shots, action, cutaways.
+Mixed = unclear.
+
+Only return the JSON object, no explanation."""
+
+
+def _collect_clips(folder) -> list:
+    """Recursively collect all clips from a media pool folder."""
+    clips = list(folder.GetClipList() or [])
+    for sub in (folder.GetSubFolderList() or []):
+        clips.extend(_collect_clips(sub))
+    return clips
+
+
+def _safe_stem(name: str) -> str:
+    """Convert clip name to a filesystem-safe stem."""
+    return re.sub(r"[^\w\-]", "_", name)[:40]
+
+
+@mcp.tool()
+def video_ai(action: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """AI video analysis: frame extraction, Claude Vision, shot tagging, QC, and clip indexing.
+
+    Requires: pip install openai  |  OPENAI_API_KEY env var  |  brew install ffmpeg
+
+    Actions:
+      list_clips(folder?) -> {clips: [{clip_id, name, file_path, type, duration}]}
+      test_extract(clip_id, position?) -> {frame_path, size_bytes}
+      test_vision(frame_path, prompt?) -> {response}
+      analyze_clip(clip_id, analyses?, position?) -> {clip_id, name, shot_type, qc, description}
+      tag_clip(clip_id, shot_type?, description?, qc_issues?) -> {success, written}
+      analyze_and_tag(clip_id, analyses?, position?) -> {clip_id, name, shot_type, qc, description, tagged}
+      batch_analyze(folder?, analyses?, max_clips?, dry_run?) -> {total, processed, failed, results}
+      analyze_mood(clip_id, position?) -> {time_of_day, location, lighting_quality, mood}
+      classify_sync_broll(clip_id, position?) -> {type, confidence, description}
+      build_index(folder?, max_clips?, force_rebuild?) -> {indexed, skipped, index_path}
+      search_clips(query, max_results?) -> {results: [{clip_id, name, description, score, reason}]}
+      smart_cut(clip_id, description, resolution?, offset_frames?, preview?) -> {found, timecode, confidence, action}
+      analyze_current_frame(analyses?) -> {shot_type, qc, description}
+
+    folder: media pool folder path, e.g. "Master/Interviews". Defaults to root.
+    analyses: list of ["shot_type", "qc", "description"]. Default: all three.
+    position: frame position 0.0–1.0 fraction of clip duration. Default: 0.5 (midpoint).
+    """
+    from src.video_ai import (
+        FRAMES_DIR, INDEX_PATH,
+        extract_frame, extract_frames_multi,
+        analyze_with_claude, query_claude_text,
+        parse_json_response,
+        load_index, save_index,
+        get_video_duration,
+    )
+
+    p = params or {}
+
+    # ── list_clips ─────────────────────────────────────────────────────────────
+    if action == "list_clips":
+        _, _, mp, err = _get_mp()
+        if err:
+            return err
+        folder_path = p.get("folder")
+        folder = _navigate_folder(mp, folder_path) if folder_path else mp.GetRootFolder()
+        if not folder:
+            return _err(f"Folder not found: {folder_path!r}")
+        clips = _collect_clips(folder)
+        result = []
+        for c in clips:
+            result.append({
+                "clip_id": c.GetUniqueId(),
+                "name": c.GetName(),
+                "file_path": c.GetClipProperty("File Path") or "",
+                "type": c.GetClipProperty("Type") or "",
+                "duration": c.GetClipProperty("Duration") or "",
+            })
+        return {"clips": result, "count": len(result)}
+
+    # ── test_extract ───────────────────────────────────────────────────────────
+    elif action == "test_extract":
+        clip_id = p.get("clip_id")
+        if not clip_id:
+            return _err("clip_id is required")
+        _, _, mp, err = _get_mp()
+        if err:
+            return err
+        clip = _find_clip(mp.GetRootFolder(), clip_id)
+        if not clip:
+            return _err(f"Clip not found: {clip_id!r}")
+        file_path = clip.GetClipProperty("File Path") or ""
+        if not file_path or not os.path.exists(file_path):
+            return _err(f"Clip file not accessible: {file_path!r}. Is media online?")
+        position = float(p.get("position", 0.5))
+        stem = _safe_stem(clip.GetName())
+        out = str(FRAMES_DIR / f"{stem}_{clip_id[:8]}.jpg")
+        try:
+            extract_frame(file_path, out, position)
+        except Exception as e:
+            return _err(str(e))
+        return {"frame_path": out, "size_bytes": os.path.getsize(out)}
+
+    # ── test_vision ────────────────────────────────────────────────────────────
+    elif action == "test_vision":
+        frame_path = p.get("frame_path")
+        if not frame_path:
+            return _err("frame_path is required")
+        if not os.path.exists(frame_path):
+            return _err(f"File not found: {frame_path!r}")
+        prompt = p.get("prompt", "Describe what you see in this video frame in 2-3 sentences.")
+        try:
+            response = analyze_with_claude(frame_path, prompt)
+        except Exception as e:
+            return _err(str(e))
+        return {"response": response}
+
+    # ── analyze_clip ───────────────────────────────────────────────────────────
+    elif action == "analyze_clip":
+        clip_id = p.get("clip_id")
+        if not clip_id:
+            return _err("clip_id is required")
+        _, _, mp, err = _get_mp()
+        if err:
+            return err
+        clip = _find_clip(mp.GetRootFolder(), clip_id)
+        if not clip:
+            return _err(f"Clip not found: {clip_id!r}")
+        file_path = clip.GetClipProperty("File Path") or ""
+        if not file_path or not os.path.exists(file_path):
+            return _err(f"Clip file not accessible: {file_path!r}. Is media online?")
+        clip_type = clip.GetClipProperty("Type") or ""
+        if "Audio" in clip_type and "Video" not in clip_type:
+            return _err(f"Clip is audio-only — no frame to extract")
+        position = float(p.get("position", 0.5))
+        stem = _safe_stem(clip.GetName())
+        frame_path = str(FRAMES_DIR / f"{stem}_{clip_id[:8]}.jpg")
+        try:
+            extract_frame(file_path, frame_path, position)
+        except Exception as e:
+            return _err(f"Frame extraction failed: {e}")
+        try:
+            raw = analyze_with_claude(frame_path, _ANALYSIS_PROMPT)
+            analysis = parse_json_response(raw)
+        except Exception as e:
+            return _err(f"Claude Vision error: {e}")
+        return {
+            "clip_id": clip_id,
+            "name": clip.GetName(),
+            "shot_type": analysis.get("shot_type", "Unknown"),
+            "qc": analysis.get("qc", {}),
+            "description": analysis.get("description", ""),
+            "frame_path": frame_path,
+        }
+
+    # ── tag_clip ───────────────────────────────────────────────────────────────
+    elif action == "tag_clip":
+        clip_id = p.get("clip_id")
+        if not clip_id:
+            return _err("clip_id is required")
+        _, _, mp, err = _get_mp()
+        if err:
+            return err
+        clip = _find_clip(mp.GetRootFolder(), clip_id)
+        if not clip:
+            return _err(f"Clip not found: {clip_id!r}")
+        written = []
+        shot_type = p.get("shot_type")
+        if shot_type:
+            color = _SHOT_TYPE_COLORS.get(shot_type)
+            if color:
+                clip.SetClipColor(color)
+                written.append(f"color={color}")
+        description = p.get("description")
+        if description:
+            clip.SetMetadata({"Comments": description})
+            written.append("description")
+        qc_issues = p.get("qc_issues") or []
+        if qc_issues:
+            note = ", ".join(qc_issues)
+            clip.AddMarker(0, "Red", "QC Issue", note, 1, "video_ai_qc")
+            written.append(f"qc_marker ({len(qc_issues)} issues)")
+        return _ok(written=written)
+
+    # ── analyze_and_tag ────────────────────────────────────────────────────────
+    elif action == "analyze_and_tag":
+        # Delegate to analyze_clip, then tag_clip
+        analysis = video_ai("analyze_clip", p)
+        if "error" in analysis:
+            return analysis
+        clip_id = analysis["clip_id"]
+        qc = analysis.get("qc", {})
+        issues = qc.get("issues", [])
+        # Also include any True bool flags as issues
+        for flag in ("overexposed", "underexposed", "out_of_focus", "noisy", "shaky"):
+            if qc.get(flag) and flag.replace("_", " ") not in " ".join(issues).lower():
+                issues.append(flag.replace("_", " "))
+        tag_result = video_ai("tag_clip", {
+            "clip_id": clip_id,
+            "shot_type": analysis.get("shot_type"),
+            "description": analysis.get("description"),
+            "qc_issues": issues if issues else None,
+        })
+        return {**analysis, "tagged": tag_result.get("written", [])}
+
+    # ── batch_analyze ──────────────────────────────────────────────────────────
+    elif action == "batch_analyze":
+        _, _, mp, err = _get_mp()
+        if err:
+            return err
+        folder_path = p.get("folder")
+        folder = _navigate_folder(mp, folder_path) if folder_path else mp.GetRootFolder()
+        if not folder:
+            return _err(f"Folder not found: {folder_path!r}")
+        clips = _collect_clips(folder)
+        # Filter to video clips only
+        clips = [c for c in clips if "Video" in (c.GetClipProperty("Type") or "")]
+        max_clips = p.get("max_clips")
+        if max_clips:
+            clips = clips[:int(max_clips)]
+        dry_run = bool(p.get("dry_run", False))
+        if dry_run:
+            return {
+                "dry_run": True,
+                "total": len(clips),
+                "clips": [{"clip_id": c.GetUniqueId(), "name": c.GetName()} for c in clips],
+            }
+        results = []
+        failed = 0
+        for clip in clips:
+            clip_id = clip.GetUniqueId()
+            try:
+                result = video_ai("analyze_and_tag", {
+                    "clip_id": clip_id,
+                    "analyses": p.get("analyses"),
+                    "position": p.get("position", 0.5),
+                })
+                if "error" in result:
+                    results.append({"clip_id": clip_id, "name": clip.GetName(), "error": result["error"]})
+                    failed += 1
+                else:
+                    results.append(result)
+            except Exception as e:
+                results.append({"clip_id": clip_id, "name": clip.GetName(), "error": str(e)})
+                failed += 1
+        processed = len(results) - failed
+        return {"total": len(clips), "processed": processed, "failed": failed, "results": results}
+
+    # ── analyze_mood ───────────────────────────────────────────────────────────
+    elif action == "analyze_mood":
+        clip_id = p.get("clip_id")
+        if not clip_id:
+            return _err("clip_id is required")
+        _, _, mp, err = _get_mp()
+        if err:
+            return err
+        clip = _find_clip(mp.GetRootFolder(), clip_id)
+        if not clip:
+            return _err(f"Clip not found: {clip_id!r}")
+        file_path = clip.GetClipProperty("File Path") or ""
+        if not file_path or not os.path.exists(file_path):
+            return _err(f"Clip file not accessible: {file_path!r}")
+        position = float(p.get("position", 0.5))
+        stem = _safe_stem(clip.GetName())
+        frame_path = str(FRAMES_DIR / f"{stem}_{clip_id[:8]}.jpg")
+        try:
+            extract_frame(file_path, frame_path, position)
+            raw = analyze_with_claude(frame_path, _MOOD_PROMPT)
+            mood = parse_json_response(raw)
+        except Exception as e:
+            return _err(str(e))
+        return {"clip_id": clip_id, "name": clip.GetName(), **mood}
+
+    # ── classify_sync_broll ────────────────────────────────────────────────────
+    elif action == "classify_sync_broll":
+        clip_id = p.get("clip_id")
+        if not clip_id:
+            return _err("clip_id is required")
+        _, _, mp, err = _get_mp()
+        if err:
+            return err
+        clip = _find_clip(mp.GetRootFolder(), clip_id)
+        if not clip:
+            return _err(f"Clip not found: {clip_id!r}")
+        file_path = clip.GetClipProperty("File Path") or ""
+        if not file_path or not os.path.exists(file_path):
+            return _err(f"Clip file not accessible: {file_path!r}")
+        position = float(p.get("position", 0.5))
+        stem = _safe_stem(clip.GetName())
+        frame_path = str(FRAMES_DIR / f"{stem}_{clip_id[:8]}.jpg")
+        try:
+            extract_frame(file_path, frame_path, position)
+            raw = analyze_with_claude(frame_path, _SYNC_BROLL_PROMPT)
+            result = parse_json_response(raw)
+        except Exception as e:
+            return _err(str(e))
+        # Write color flag
+        clip_type = result.get("type", "")
+        if clip_type == "Dialogue":
+            clip.SetClipColor("Red")
+        elif clip_type == "B-Roll":
+            clip.SetClipColor("Blue")
+        return {"clip_id": clip_id, "name": clip.GetName(), **result}
+
+    # ── build_index ────────────────────────────────────────────────────────────
+    elif action == "build_index":
+        _, _, mp, err = _get_mp()
+        if err:
+            return err
+        folder_path = p.get("folder")
+        folder = _navigate_folder(mp, folder_path) if folder_path else mp.GetRootFolder()
+        if not folder:
+            return _err(f"Folder not found: {folder_path!r}")
+        clips = _collect_clips(folder)
+        clips = [c for c in clips if "Video" in (c.GetClipProperty("Type") or "")]
+        max_clips = p.get("max_clips")
+        if max_clips:
+            clips = clips[:int(max_clips)]
+        force = bool(p.get("force_rebuild", False))
+        index = {} if force else load_index()
+        indexed = 0
+        skipped = 0
+        for clip in clips:
+            clip_id = clip.GetUniqueId()
+            if clip_id in index and not force:
+                skipped += 1
+                continue
+            file_path = clip.GetClipProperty("File Path") or ""
+            if not file_path or not os.path.exists(file_path):
+                skipped += 1
+                continue
+            try:
+                stem = _safe_stem(clip.GetName())
+                frame_path = str(FRAMES_DIR / f"{stem}_{clip_id[:8]}.jpg")
+                extract_frame(file_path, frame_path, 0.5)
+                description_prompt = (
+                    "Write exactly one sentence describing what is happening in this video frame. "
+                    "Be specific and factual. Return only the sentence, no JSON, no labels."
+                )
+                description = analyze_with_claude(frame_path, description_prompt).strip()
+                import datetime
+                index[clip_id] = {
+                    "name": clip.GetName(),
+                    "description": description,
+                    "file_path": file_path,
+                    "indexed_at": datetime.datetime.now().isoformat(),
+                }
+                save_index(index)
+                indexed += 1
+            except Exception:
+                skipped += 1
+        return {"indexed": indexed, "skipped": skipped, "index_path": str(INDEX_PATH)}
+
+    # ── search_clips ───────────────────────────────────────────────────────────
+    elif action == "search_clips":
+        query = p.get("query")
+        if not query:
+            return _err("query is required")
+        index = load_index()
+        if not index:
+            return _err(f"Clip index is empty. Run build_index first.")
+        max_results = int(p.get("max_results", 10))
+        clips_list = [{"clip_id": cid, "name": v["name"], "description": v["description"]}
+                      for cid, v in index.items()]
+        search_prompt = (
+            f"I have a list of video clip descriptions and a search query. "
+            f"Return ONLY a JSON array of the best matching clips, sorted by relevance (highest score first).\n\n"
+            f"Query: \"{query}\"\n\n"
+            f"Clips:\n{json.dumps(clips_list, indent=2)}\n\n"
+            f"Return format: [{{\"clip_id\": \"...\", \"score\": 0.0-1.0, \"reason\": \"one sentence\"}}]\n"
+            f"Only include clips with score > 0.3. Max {max_results} results."
+        )
+        try:
+            raw = query_claude_text(search_prompt)
+            results = parse_json_response(raw)
+        except Exception as e:
+            return _err(f"Search failed: {e}")
+        # Enrich results with name and description from index
+        enriched = []
+        for r in results[:max_results]:
+            cid = r.get("clip_id", "")
+            entry = index.get(cid, {})
+            enriched.append({
+                "clip_id": cid,
+                "name": entry.get("name", r.get("name", "")),
+                "description": entry.get("description", ""),
+                "score": r.get("score", 0),
+                "reason": r.get("reason", ""),
+            })
+        return {"results": enriched, "total_in_index": len(index)}
+
+    # ── smart_cut ──────────────────────────────────────────────────────────────
+    elif action == "smart_cut":
+        clip_id = p.get("clip_id")
+        description = p.get("description")
+        if not clip_id:
+            return _err("clip_id is required")
+        if not description:
+            return _err("description is required (e.g. 'where the person starts to jump')")
+
+        resolution = p.get("resolution", "medium")
+        offset_frames = int(p.get("offset_frames", 0))
+        preview = bool(p.get("preview", True))
+
+        # seconds between sample frames per resolution level
+        _INTERVALS = {"low": 2.0, "medium": 0.5, "high": 0.1}
+        coarse_interval = 2.0  # always start with 2s coarse pass
+        fine_interval = _INTERVALS.get(resolution, 0.5)
+
+        # 1. Get clip
+        _, _, mp, err = _get_mp()
+        if err:
+            return err
+        clip = _find_clip(mp.GetRootFolder(), clip_id)
+        if not clip:
+            return _err(f"Clip not found: {clip_id!r}")
+        file_path = clip.GetClipProperty("File Path") or ""
+        if not file_path or not os.path.exists(file_path):
+            return _err(f"Clip file not accessible: {file_path!r}")
+        clip_name = clip.GetName()
+
+        try:
+            duration = get_video_duration(file_path)
+        except Exception as e:
+            return _err(f"Could not read clip duration: {e}")
+
+        frames_dir = str(FRAMES_DIR / f"smart_cut_{_safe_stem(clip_name)}_{clip_id[:8]}")
+        os.makedirs(frames_dir, exist_ok=True)
+
+        def _sample_times(interval: float, start: float = 0.0, end: float | None = None) -> list[float]:
+            stop = end if end is not None else duration
+            times, t = [], start
+            while t < stop:
+                times.append(min(t, stop - 0.05))
+                t += interval
+            return times or [stop * 0.5]
+
+        def _extract_batch(times: list[float]) -> list[dict]:
+            """Extract frames at given times, return [{path, time_secs}]."""
+            frames = []
+            for t in times:
+                pos = t / duration if duration > 0 else 0.5
+                out = os.path.join(frames_dir, f"f_{t:.3f}.jpg")
+                try:
+                    extract_frame(file_path, out, pos)
+                    frames.append({"path": out, "time_secs": t})
+                except Exception:
+                    pass
+            return frames
+
+        def _analyze_batch(frame_data: list[dict]) -> list[dict]:
+            """Send up to 8 frames at once to GPT, return per-frame confidence dicts."""
+            BATCH = 8
+            scores = []
+            for i in range(0, len(frame_data), BATCH):
+                chunk = frame_data[i : i + BATCH]
+                paths = [f["path"] for f in chunk]
+                info = "\n".join(f"Frame {j}: {chunk[j]['time_secs']:.2f}s" for j in range(len(chunk)))
+                prompt = (
+                    f'Analyze these {len(chunk)} video frames to find a specific moment.\n\n'
+                    f'Target action: "{description}"\n\n'
+                    f'Frame timecodes (in order):\n{info}\n\n'
+                    f'Return ONLY a JSON array, one object per frame:\n'
+                    f'[\n'
+                    f'  {{"frame_idx": 0, "time_secs": 0.0, "confidence": 0.0, '
+                    f'"action_started": false, "action_completed": false, "reasoning": "..."}}\n'
+                    f']\n\n'
+                    f'confidence: 0.0-1.0 — probability this frame is AT or just before the described action begins.\n'
+                    f'action_started: true when the described action has just started in this frame.\n'
+                    f'action_completed: true when the described action is already finished.\n'
+                    f'Only return the JSON array, no other text.'
+                )
+                try:
+                    raw = analyze_with_claude(paths, prompt)
+                    batch_scores = parse_json_response(raw)
+                    for j, score in enumerate(batch_scores):
+                        if j < len(chunk):
+                            score["time_secs"] = chunk[j]["time_secs"]
+                            score["path"] = chunk[j]["path"]
+                    scores.extend(batch_scores)
+                except Exception:
+                    pass
+            return scores
+
+        # ── Two-pass sampling ──────────────────────────────────────────────────
+        # Pass 1: coarse scan (every 2s) across whole clip
+        coarse_frames = _extract_batch(_sample_times(coarse_interval))
+        if not coarse_frames:
+            return _err("Failed to extract any frames from clip")
+
+        coarse_scores = _analyze_batch(coarse_frames)
+        frames_analysed = len(coarse_scores)
+
+        all_scores = coarse_scores
+
+        # If medium or high resolution, do a fine-grained pass in the best region
+        if resolution in ("medium", "high") and coarse_scores:
+            best_coarse = max(coarse_scores, key=lambda s: s.get("confidence", 0))
+            region_center = best_coarse.get("time_secs", duration * 0.5)
+            region_start = max(0.0, region_center - 5.0)
+            region_end = min(duration, region_center + 5.0)
+
+            fine_frames = _extract_batch(_sample_times(fine_interval, region_start, region_end))
+            if fine_frames:
+                fine_scores = _analyze_batch(fine_frames)
+                frames_analysed += len(fine_scores)
+                # Merge: fine scores override coarse scores in their region
+                coarse_outside = [s for s in coarse_scores
+                                  if not (region_start <= s.get("time_secs", 0) <= region_end)]
+                all_scores = coarse_outside + fine_scores
+
+        if not all_scores:
+            return _err("Vision API analysis returned no results")
+
+        # ── Find the best cut frame ────────────────────────────────────────────
+        started = [s for s in all_scores if s.get("action_started")]
+        if started:
+            # First frame where action begins, prefer highest confidence among ties
+            best = min(started, key=lambda s: (
+                -s.get("confidence", 0) if s.get("confidence", 0) >= 0.3 else 0,
+                s.get("time_secs", 0)
+            ))
+        else:
+            best = max(all_scores, key=lambda s: s.get("confidence", 0))
+
+        if best.get("confidence", 0) < 0.3:
+            top3 = sorted(all_scores, key=lambda s: s.get("confidence", 0), reverse=True)[:3]
+            return {
+                "found": False,
+                "message": "Could not find that moment with sufficient confidence. Try rephrasing the description.",
+                "top_candidates": [
+                    {"time_secs": c.get("time_secs"), "confidence": c.get("confidence"),
+                     "reasoning": c.get("reasoning", "")} for c in top3
+                ],
+                "frames_analysed": frames_analysed,
+            }
+
+        cut_time_secs = best["time_secs"]
+        confidence = best.get("confidence", 0)
+        reasoning = best.get("reasoning", "")
+
+        # ── Convert to timeline frame & apply ─────────────────────────────────
+        _, proj, check_err = _check()
+        if check_err:
+            return {"found": True, "time_secs": cut_time_secs, "confidence": confidence,
+                    "reasoning": reasoning, "frames_analysed": frames_analysed,
+                    "action": "analysis_only",
+                    "message": "No Resolve connection. Cut point found but could not be applied."}
+
+        tl = proj.GetCurrentTimeline()
+        if not tl:
+            return {"found": True, "time_secs": cut_time_secs, "confidence": confidence,
+                    "reasoning": reasoning, "frames_analysed": frames_analysed,
+                    "action": "analysis_only", "message": "No timeline open."}
+
+        # Timeline FPS
+        fps_setting = proj.GetSetting("timelineFrameRate") or "25"
+        try:
+            fps = float(str(fps_setting).split()[0])
+        except Exception:
+            fps = 25.0
+
+        # Find the timeline item linked to this clip
+        tl_item = None
+        for vi in range(1, tl.GetTrackCount("video") + 1):
+            for item in (tl.GetItemListInTrack("video", vi) or []):
+                mpi = item.GetMediaPoolItem()
+                if mpi and mpi.GetUniqueId() == clip_id:
+                    tl_item = item
+                    break
+            if tl_item:
+                break
+
+        if not tl_item:
+            return {"found": True, "time_secs": cut_time_secs, "confidence": confidence,
+                    "reasoning": reasoning, "frames_analysed": frames_analysed,
+                    "action": "analysis_only",
+                    "message": f"Clip '{clip_name}' is not on the current timeline. "
+                               f"Cut point is at {cut_time_secs:.2f}s in the source file."}
+
+        # Source time → timeline frame
+        source_start_time = tl_item.GetSourceStartTime()
+        time_from_clip_start = cut_time_secs - source_start_time
+        tl_start = int(tl_item.GetStart())
+        tl_end = int(tl_item.GetEnd())
+        cut_tl_frame = tl_start + int(time_from_clip_start * fps) + offset_frames
+        cut_tl_frame = max(tl_start + 1, min(cut_tl_frame, tl_end - 1))
+
+        marker_note = f"{description} — {reasoning} (confidence: {confidence:.2f})"
+
+        cut_timecode = _tc_from_frame(tl, cut_tl_frame, fps)
+
+        if preview:
+            ok = tl.AddMarker(cut_tl_frame, "Orange", "AI Cut Point", marker_note, 1, "smart_cut")
+            return {
+                "found": True,
+                "time_secs": cut_time_secs,
+                "timecode": cut_timecode,
+                "timeline_frame": cut_tl_frame,
+                "confidence": confidence,
+                "reasoning": reasoning,
+                "frames_analysed": frames_analysed,
+                "action": "marker_added" if ok else "marker_failed",
+                "marker_color": "Orange",
+                "next_step": f"Orange marker at {cut_timecode}. "
+                             "Review in Resolve, then call smart_cut with preview=false to execute the cut.",
+            }
+        else:
+            # Pure scripting API split — no osascript, no permissions required.
+            # Delete the original clip then re-insert as two clips via AppendToTimeline.
+            mpi = tl_item.GetMediaPoolItem()
+            source_start = int(tl_item.GetSourceStartFrame())
+            source_end = int(tl_item.GetSourceEndFrame())
+            timeline_start = int(tl_item.GetStart())
+
+            # Cut point in source-file frames, clamped to leave ≥1 frame per half
+            cut_source_frame = int(cut_time_secs * fps)
+            cut_source_frame = max(source_start + 1, min(cut_source_frame, source_end - 1))
+
+            if cut_source_frame <= source_start or cut_source_frame >= source_end:
+                return _err(
+                    f"Cut point ({cut_source_frame}) is at or beyond clip boundaries "
+                    f"({source_start}–{source_end}). Try a different moment or adjust offset_frames."
+                )
+
+            clip1_frames = cut_source_frame - source_start
+
+            clip_info_1 = {
+                "mediaPoolItem": mpi,
+                "startFrame": source_start,
+                "endFrame": cut_source_frame - 1,
+                "recordFrame": timeline_start,
+            }
+            clip_info_2 = {
+                "mediaPoolItem": mpi,
+                "startFrame": cut_source_frame,
+                "endFrame": source_end,
+                "recordFrame": timeline_start + clip1_frames,
+            }
+
+            del_ok = tl.DeleteClips([tl_item])
+            if not del_ok:
+                return _err("DeleteClips failed — could not remove original clip before split")
+
+            new_items = mp.AppendToTimeline([clip_info_1, clip_info_2])
+            if not new_items or len(new_items) < 2:
+                return _err(
+                    f"AppendToTimeline returned {len(new_items) if new_items else 0} items "
+                    f"(expected 2) — split incomplete"
+                )
+
+            try:
+                new_id_1 = new_items[0].GetUniqueId()
+                new_id_2 = new_items[1].GetUniqueId()
+            except Exception:
+                new_id_1 = new_id_2 = None
+
+            return {
+                "found": True,
+                "time_secs": cut_time_secs,
+                "timecode": cut_timecode,
+                "timeline_frame": cut_tl_frame,
+                "confidence": confidence,
+                "reasoning": reasoning,
+                "frames_analysed": frames_analysed,
+                "action": "split_via_append",
+                "method": "DeleteClips + AppendToTimeline with clipInfo dicts",
+                "clip_1": {
+                    "id": new_id_1,
+                    "source_start_frame": source_start,
+                    "source_end_frame": cut_source_frame - 1,
+                    "record_frame": timeline_start,
+                },
+                "clip_2": {
+                    "id": new_id_2,
+                    "source_start_frame": cut_source_frame,
+                    "source_end_frame": source_end,
+                    "record_frame": timeline_start + clip1_frames,
+                },
+            }
+
+    # ── analyze_current_frame ──────────────────────────────────────────────────
+    elif action == "analyze_current_frame":
+        # Uses timeline.GetCurrentClipThumbnailImage() — works on the Color page
+        _, tl, err = _get_tl()
+        if err:
+            return err
+        thumb = tl.GetCurrentClipThumbnailImage()
+        if not thumb:
+            return _err("No thumbnail available — ensure the Color page is active with a clip under the playhead")
+        width = thumb.get("width")
+        height = thumb.get("height")
+        b64_data = thumb.get("data")
+        if not (width and height and b64_data):
+            return _err(f"Thumbnail data incomplete: {list(thumb.keys())}")
+        try:
+            import base64 as _b64
+            from PIL import Image as _Image
+            import io as _io
+            raw_bytes = _b64.b64decode(b64_data)
+            img = _Image.frombytes("RGB", (int(width), int(height)), raw_bytes)
+            frame_path = str(FRAMES_DIR / "current_frame.png")
+            os.makedirs(str(FRAMES_DIR), exist_ok=True)
+            img.save(frame_path, "PNG")
+        except Exception as e:
+            return _err(f"Image conversion failed: {e}")
+        try:
+            raw = analyze_with_claude(frame_path, _ANALYSIS_PROMPT)
+            analysis = parse_json_response(raw)
+        except Exception as e:
+            return _err(f"GPT Vision error: {e}")
+        return {
+            "shot_type": analysis.get("shot_type", "Unknown"),
+            "qc": analysis.get("qc", {}),
+            "description": analysis.get("description", ""),
+            "frame_path": frame_path,
+            "thumbnail_size": f"{width}x{height}",
+        }
+
+    return _unknown(action, [
+        "list_clips", "test_extract", "test_vision",
+        "analyze_clip", "tag_clip", "analyze_and_tag",
+        "batch_analyze",
+        "analyze_mood", "classify_sync_broll",
+        "build_index", "search_clips",
+        "smart_cut",
+        "analyze_current_frame",
+    ])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TOOL 29: execute_lua
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+def execute_lua(script: str, timeout: int = 30) -> Dict[str, Any]:
+    """
+    Execute an arbitrary Lua script inside DaVinci Resolve via fuscript.
+
+    The script runs in Resolve's Lua environment — use `Resolve()` (capital R)
+    to obtain the resolve object. stdout/stderr from the script are captured.
+
+    Parameters
+    ----------
+    script : str   Lua source code to execute.
+    timeout : int  Max seconds to wait (default 30).
+
+    Returns {stdout, stderr, returncode, success}.
+    """
+    if not os.path.exists(FUSCRIPT_PATH):
+        return _err(f"fuscript not found at {FUSCRIPT_PATH}. Is DaVinci Resolve installed?")
+    result = _run_lua(script, timeout=timeout)
+    result["success"] = result["returncode"] == 0
+    return result
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Server Startup
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2897,5 +3756,5 @@ if __name__ == "__main__":
         run_fastmcp_stdio(granular_mcp)
         sys.exit(0)
 
-    logger.info(f"Starting DaVinci Resolve MCP Server (27 compound tools)")
+    logger.info(f"Starting DaVinci Resolve MCP Server (29 compound tools)")
     run_fastmcp_stdio(mcp)

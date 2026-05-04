@@ -239,6 +239,90 @@ Once connected, you can control DaVinci Resolve through natural language:
 "Create a Fusion composition on the selected clip"
 ```
 
+## AI Video Analysis (video_ai tool)
+
+The `video_ai` compound tool adds AI-powered analysis and editing on top of the standard Resolve scripting API. It requires an OpenAI API key and ffmpeg.
+
+### Requirements
+
+- `pip install openai pillow`
+- `brew install ffmpeg` (Apple Silicon: `/opt/homebrew/bin/ffmpeg`, Intel: `/usr/local/bin/ffmpeg`)
+- `OPENAI_API_KEY` set in your shell profile so Claude Desktop inherits it
+
+### smart_cut
+
+`smart_cut` lets you describe a moment in a clip in plain language and have it automatically cut there on the timeline.
+
+**How it works**
+
+1. You provide a `clip_id` and a natural language `description` of the moment to cut at, for example: `"where the person starts to run"` or `"the frame just before the door opens"`.
+2. The tool extracts frames from the source file using ffmpeg. It runs a coarse pass every 2 seconds across the full clip, then a fine pass at 0.5 second intervals around the most likely region.
+3. Each batch of up to 8 frames is sent to GPT-4o-mini Vision with a prompt asking it to rate how closely each frame matches the described action and flag whether the action has started or completed.
+4. The frame with the highest confidence score where the action has started is selected as the cut point.
+5. In preview mode (the default), an orange marker is placed at that timecode so you can review it in Resolve before committing.
+6. When you call again with `preview: false`, the tool executes the actual cut using the Resolve scripting API directly: no keyboard shortcuts, no AppleScript, no accessibility permissions required.
+
+**How the cut is executed**
+
+`Split()` is not exposed in the Resolve 20 scripting API. Instead the tool uses a confirmed-working workaround via `AppendToTimeline` with `clipInfo` dictionaries:
+
+1. The timeline item for the clip is located by scanning video tracks and matching the clip's unique ID.
+2. `GetSourceStartFrame()` and `GetSourceEndFrame()` give the clip's source range. `GetStart()` gives its position on the timeline.
+3. The cut point is converted from seconds to a source frame number: `cut_source_frame = int(cut_time_secs * fps)`.
+4. The original timeline item is removed with `timeline.DeleteClips([item])`.
+5. Two replacement clips are inserted with `mediaPool.AppendToTimeline([clipInfo1, clipInfo2])`, where each dict carries `mediaPoolItem`, `startFrame`, `endFrame`, and `recordFrame` so they land in exactly the right position with no gap.
+
+**Parameters**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `clip_id` | string | required | Name or unique ID of the media pool clip |
+| `description` | string | required | Plain language description of the cut moment |
+| `preview` | bool | `true` | Place an orange marker instead of cutting |
+| `resolution` | string | `"medium"` | Sampling density: `low` (2s), `medium` (0.5s), `high` (0.1s) |
+| `offset_frames` | int | `0` | Shift the detected cut point by N frames |
+
+**Example**
+
+```
+"Find where the athlete starts to jump in clip 'athlete_wide.mov' and cut there"
+
+video_ai(action="smart_cut", params={
+  clip_id: "athlete_wide.mov",
+  description: "the moment the athlete's feet leave the ground",
+  preview: true
+})
+```
+
+Resolve shows an orange marker at the detected frame. After reviewing:
+
+```
+video_ai(action="smart_cut", params={
+  clip_id: "athlete_wide.mov",
+  description: "the moment the athlete's feet leave the ground",
+  preview: false
+})
+```
+
+The clip is split into two clips in place on the timeline.
+
+### Other video_ai actions
+
+| Action | Description |
+|--------|-------------|
+| `analyze_clip` | Shot type classification, QC flags, and one-sentence description via GPT Vision |
+| `tag_clip` | Write shot type as clip color, description as Comments metadata, QC issues as red markers |
+| `analyze_and_tag` | Run both in one call |
+| `batch_analyze` | Process all clips in a folder, with optional `max_clips` and `dry_run` |
+| `analyze_mood` | Classify time of day, location, lighting quality, and mood |
+| `classify_sync_broll` | Detect whether a clip is dialogue, b-roll, or mixed |
+| `build_index` | Extract and cache GPT descriptions for all clips into a JSON index |
+| `search_clips` | Semantic search over the index: describe what you are looking for in plain English |
+| `analyze_current_frame` | Analyze whatever is under the playhead on the Color page (no source file needed) |
+| `list_clips` | List all clips in the media pool with file paths and durations |
+
+---
+
 ## Test Results
 
 Baseline testing was performed against **DaVinci Resolve 19.1.3 Studio** on macOS with live API calls (no mocks). Resolve 20 additions were revalidated live against **DaVinci Resolve 20.3.2 Studio**.
